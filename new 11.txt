@@ -1,0 +1,187 @@
+package com.successfactors.workstructure.app.processor;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import org.jboss.seam.ScopeType;
+import org.jboss.seam.annotations.Name;
+import org.jboss.seam.annotations.Scope;
+
+import com.successfactors.applicationcontext.api.ApplicationContext;
+import com.successfactors.genericobject.api.exception.ValidationException;
+import com.successfactors.genericobject.api.messages.Message;
+import com.successfactors.genericobject.api.model.DataOperation;
+import com.successfactors.genericobject.api.processor.OperationContext;
+import com.successfactors.genericobject.api.processor.OperationStatus;
+import com.successfactors.genericobject.api.processor.ValidationContext;
+import com.successfactors.genericobject.api.sql.MDFResultSet;
+import com.successfactors.genericobject.app.processor.AbstractProcessor;
+import com.successfactors.genericobject.bean.businessobjects.Country;
+import com.successfactors.i18n.service.IMessageBundle;
+import com.successfactors.logging.api.LogManager;
+import com.successfactors.logging.api.Logger;
+import com.successfactors.sca.ServiceApplicationException;
+import com.successfactors.workstructure.api.IValidationResult;
+import com.successfactors.workstructure.app.validator.BankValidator;
+import com.successfactors.workstructure.bean.core.model.Bank;
+import com.successfactors.workstructure.service.shared.impl.BankServiceImpl;
+import com.successfactors.di.api.SFContext;
+import com.successfactors.di.api.SFContextConstant;
+
+/**
+ * This processor will check the validations on the BANK
+ * 
+ * @author Yadav Kumar Arora
+ * 
+ */
+@Name(BankProcessor.SEAM_NAME)
+@javax.inject.Named(BankProcessor.SEAM_NAME)
+@Scope(ScopeType.EVENT)
+@org.springframework.context.annotation.Scope(SFContextConstant.SCOPE_EVENT)
+public class BankProcessor extends AbstractProcessor {
+
+	/** logger. */
+	private static Logger logger = LogManager.getLogger();
+
+	public static final String SEAM_NAME = "BankProcessor";
+
+	private static final String MESSAGE_DUPLICATE_BANK_DETAILS = "EMPLOYMENT_GO_DUPLICATE_BANK_DETAILS";
+	
+	private static final String MESSAGE_DEL_BANK_FAIL = "WORKSTRUCTURE_GO_REF_BANK_EXIST";
+	
+	private static final String EXTERNAL_CODE_LABEL = "WORKSTRUCTURE_GO_Bank_externalCode";
+
+	@Override
+	public void preSave(final ValidationContext context) throws ValidationException {
+		for (OperationContext opContext : context.getAllOperationContexts()) {
+			Bank bank = (Bank) opContext.getBean();
+			boolean bankExists = false;
+			if (opContext.getDataOperation() == DataOperation.CORRECT) {
+				bankExists = checkBank(bank.getRoutingNumber(), bank.getBusinessIdentifierCode(), bank.getBankCountry(),
+						opContext.getOriginalGenericObject().getInternalCode());
+				if (!bankExists) {
+					if (checkBank(bank.getRoutingNumber(), bank.getBusinessIdentifierCode(), bank.getBankCountry(),
+							null)) {
+						opContext.addErrorMessages(new Message(MESSAGE_DUPLICATE_BANK_DETAILS));
+					}
+				}
+			} else if (opContext.getDataOperation() == DataOperation.CREATE) {
+				bankExists = checkBank(bank.getRoutingNumber(), bank.getBusinessIdentifierCode(), bank.getBankCountry(),
+						null);
+				if (bankExists) {
+					opContext.addErrorMessages(new Message(MESSAGE_DUPLICATE_BANK_DETAILS));
+				}
+			}
+		}
+	}
+
+	/**
+	 * checks whether
+	 * 
+	 * @param bank
+	 * @return
+	 * @throws ValidationException
+	 */
+	private boolean checkBank(String routingNumber, String businessIdentifierCode, Country bankCountry, Long internalId)
+			throws ValidationException {
+		try {
+			BankServiceImpl bankServiceImpl = getBankServiceImpl();
+
+			MDFResultSet resultSet = bankServiceImpl.searchBank(routingNumber, businessIdentifierCode, bankCountry,
+					internalId);
+
+			if (resultSet == null || resultSet.getBeans() == null || resultSet.getBeans().size() == 0) {
+				return false; // nothing found
+			}
+
+			return true;
+
+		} catch (ServiceApplicationException e) {
+			logger.error("Exception when reading the Bank Directory.", e);
+			throw new ValidationException(e);
+		}
+
+	}
+	
+	public IMessageBundle getMessageBundle()
+	{ 
+	    IMessageBundle msgs = null;
+	    msgs = (IMessageBundle) SFContext.getContext().getInstance("msgs", true);
+	    return msgs;
+	}
+	
+	@Override
+	public void validate(ValidationContext context) {
+		for (OperationContext operationContext : context.getSuccessfullOperationContexts()) {
+			List<IValidationResult> msgResult = new ArrayList<>();
+			List<IValidationResult> warningMsgResult = new ArrayList<>();
+			BankValidator bankValidator = new BankValidator();
+			Bank bank = (Bank) operationContext.getBean();
+			if (bank != null) {
+				if (!bankValidator.validateExternalCode(bank.getExternalCode())) {
+					IValidationResult vResult = ApplicationContext.get(IValidationResult.class);
+					vResult.setStatus(IValidationResult.Status.FAILURE);
+					vResult.setMessage(new Message("EMPLOYMENT_GO_ERROR_MSGS_FOR_EXTERNAL_CODE_ENTRY",getMessageBundle().getString(EXTERNAL_CODE_LABEL)));
+					msgResult.add(vResult);
+				}
+				try {
+					bankValidator.preformCountrySpecificValidation(bank, msgResult, warningMsgResult);
+				} catch (ServiceApplicationException e) {
+					logger.info("Bank Info" + e.getMessage());
+				}
+			}
+
+			for (IValidationResult errorMessage : msgResult) {
+				addMessage(operationContext, errorMessage, context);
+			}
+			if (msgResult.isEmpty()) {
+				for (IValidationResult warningMessage : warningMsgResult) {
+					addMessage(operationContext, warningMessage, context);
+				}
+				if (!warningMsgResult.isEmpty()) {
+					IValidationResult vResult = ApplicationContext.get(IValidationResult.class);
+					vResult.setStatus(IValidationResult.Status.WARNING);
+					vResult.setMessage(
+							new Message("EMPLOYMENT_GO_COUNTRYSPECIFICCONFIGURATION_DO_YOU_WISH_TO_CONTINUE"));
+					addMessage(operationContext, vResult, context);
+				}
+			}
+
+		}
+
+	}
+
+	@Override
+	public void preDelete(final ValidationContext context) throws ValidationException {
+		logger.info("Checking reference bank usage exists");
+		for (OperationContext opContext : context.getAllOperationContexts()) {
+			Bank bank = (Bank) opContext.getBean();
+			BankServiceImpl bankServiceImpl = getBankServiceImpl();
+			if (!bankServiceImpl.checkBankReferenceUsed(bank)) {
+				logger.info("reference bank exists failing deletion");
+				opContext.addErrorMessages(new Message(MESSAGE_DEL_BANK_FAIL));
+				return;
+			}
+
+		}
+		logger.info("No reference bank ");
+	}
+
+	public BankServiceImpl getBankServiceImpl() {
+		return (BankServiceImpl) SFContext.getContext()
+				.getInstance(BankServiceImpl.SEAM_NAME, true);
+	}
+
+	private void addMessage(OperationContext opContext, IValidationResult msg, ValidationContext context) {
+		switch (msg.getStatus()) {
+		case FAILURE:
+			opContext.addMessage(OperationStatus.ERROR, msg.getMessage());
+			break;
+		case WARNING:
+			if (!context.isWarningsAcknowledged()) {
+				opContext.addMessage(OperationStatus.WARNING, msg.getMessage());
+				break;
+			}
+		}
+	}
+}
